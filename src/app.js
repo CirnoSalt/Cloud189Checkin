@@ -10,10 +10,6 @@ log4js.configure({
     },
     out: {
       type: 'console',
-      layout: {
-        type: 'pattern',
-        pattern: '%d %p %c %X{user} %m%n',
-      },
     },
   },
   categories: { default: { appenders: ['vcr', 'out'], level: 'info' } },
@@ -26,6 +22,8 @@ const superagent = require('superagent');
 const config = require('../config');
 const accounts = require('../accounts');
 const serverChan = require('../serverChan');
+const telegramBot = require('../telegramBot');
+const wecomBot = require('../wecomBot');
 
 const client = superagent.agent();
 const headers = {
@@ -178,14 +176,6 @@ const doGet = (taskUrl) => new Promise((resolve, reject) => {
 
 const mask = (s, start, end) => s.split('').fill('*', start, end).join('');
 
-class NetTestError extends Error {
-  constructor(message) {
-    super(message);
-    this.code = 'ECONNRESET';
-    this.errno = -104;
-  }
-}
-
 // 登录流程 1.获取公钥 -> 2.获取登录参数 -> 3.获取登录地址,跳转到登录页
 const doLogin = (userName, password) => new Promise((resolve, reject) => {
   getEncrypt()
@@ -193,9 +183,9 @@ const doLogin = (userName, password) => new Promise((resolve, reject) => {
     .then((formData) => login(formData))
     .then(() => resolve('登录成功'))
     .catch((error) => {
+      logger.error(`登录失败:${JSON.stringify(error)}`);
       reject(error);
     });
-  // reject(new NetTestError('测试网络异常'));
 });
 
 // 任务 1.签到 2.天天抽红包 3.自动备份抽红包
@@ -234,17 +224,71 @@ const pushServerChan = (title, desp) => {
     .send(data)
     .end((err, res) => {
       if (err) {
-        logger.error(`推送失败:${JSON.stringify(err)}`);
+        logger.error(`ServerChan推送失败:${JSON.stringify(err)}`);
         return;
       }
       const json = JSON.parse(res.text);
       if (json.code !== 0) {
-        logger.error(`推送失败:${JSON.stringify(json)}`);
+        logger.error(`ServerChan推送失败:${JSON.stringify(json)}`);
       } else {
-        logger.info('推送成功');
+        logger.info('ServerChan推送成功');
       }
     });
 };
+
+const pushTelegramBot = (title, desp) => {
+  if (!(telegramBot.botToken && telegramBot.chatId)) { return; }
+  const data = {
+    chat_id: telegramBot.chatId,
+    text: title + "\n\n" + desp,
+  };
+  superagent.post(`https://api.telegram.org/bot${telegramBot.botToken}/sendMessage`)
+    .type('form')
+    .send(data)
+    .end((err, res) => {
+      if (err) {
+        logger.error(`TelegramBot推送失败:${JSON.stringify(err)}`);
+        return;
+      }
+      const json = JSON.parse(res.text);
+      if (!json.ok) {
+        logger.error(`TelegramBot推送失败:${JSON.stringify(json)}`);
+      } else {
+        logger.info('TelegramBot推送成功');
+      }
+    });
+};
+
+const pushWecomBot = (title, desp) => {
+  if (!(wecomBot.key && wecomBot.telphone)) { return; }
+  const data = {
+    msgtype: "text",
+    text: {
+      content: title + "\n\n" + desp,
+      mentioned_mobile_list: [wecomBot.telphone]
+    }
+  };
+  superagent.post(`https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${wecomBot.key}`)
+    .send(data)
+    .end((err, res) => {
+      if (err) {
+        logger.error(`wecomBot推送失败:${JSON.stringify(err)}`);
+        return;
+      }
+      const json = JSON.parse(res.text);
+      if (json.errcode) {
+        logger.error(`wecomBot推送失败:${JSON.stringify(json)}`);
+      } else {
+        logger.info('wecomBot推送成功');
+      }
+    });
+};
+
+const push = (title, desp) => {
+  pushServerChan(title, desp);
+  pushTelegramBot(title, desp);
+  pushWecomBot(title, desp);
+}
 
 // 开始执行程序
 async function main() {
@@ -252,46 +296,31 @@ async function main() {
     const account = accounts[index];
     const { userName, password } = account;
     if (userName && password) {
+      const userNameInfo = mask(userName, 3, 7);
       try {
-        const userNameInfo = mask(userName, 3, 7);
-        logger.addContext('user', userNameInfo);
+        logger.log(`账户 ${userNameInfo}开始执行`);
         await doLogin(userName, password);
         const result = await doTask();
         result.forEach((r) => logger.log(r));
         logger.log('任务执行完毕');
       } catch (e) {
-        logger.error(`登录失败:${JSON.stringify(e)}`);
         if (e.code === 'ECONNRESET') {
-          throw new Error('Login Error');
+          throw e;
         }
       } finally {
-        logger.removeContext('user');
+        logger.log(`账户 ${userNameInfo}执行完毕`);
       }
-      // await doLogin(userName, password).then(() => {
-      //   logger.log('登录成功开始执行任务');
-      //   return doTask().then((result) => {
-      //     result.forEach((r) => logger.log(r));
-      //     logger.log('任务执行完毕');
-      //   }).catch((e) => {
-      //     logger.error(`任务执行失败:${JSON.stringify(e)}`);
-      //   });
-      // }).catch((e) => {
-      //   logger.error(`登录失败:${JSON.stringify(e)}`);
-      //   if (e.code === 'ECONNRESET') {
-      //     throw new Error('Login Error');
-      //   }
-      // }).finally(() => {
-      //   logger.removeContext('user');
-      // });
     }
   }
 }
 
-main().catch((e) => {
-  throw e;
-}).finally(() => {
-  const events = recording.replay();
-  const content = events.map((e) => `${e.context.user} ${e.data.join('')}`).join('  \n');
-  pushServerChan('天翼云盘自动签到任务', content);
-  recording.erase();
-});
+(async () => {
+  try {
+    await main();
+  } finally {
+    const events = recording.replay();
+    const content = events.map((e) => `${e.data.join('')}`).join('  \n');
+    push('天翼云盘自动签到任务', content);
+    recording.erase();
+  }
+})();
